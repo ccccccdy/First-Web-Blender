@@ -3,8 +3,8 @@ package com.jin.blender.controller;
 import com.jin.blender.entity.Artwork;
 import com.jin.blender.repository.ArtworkRepository;
 import com.jin.blender.service.FileStorageService;
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.jin.blender.support.ReviewStatus;
+import com.jin.blender.support.ReviewSupport;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -12,21 +12,26 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
-import java.util.*;
-import java.util.stream.Collectors;
+import java.util.Date;
+import java.util.List;
+import java.util.Optional;
 
 @RestController
 @RequestMapping("/api/artworks")
 @CrossOrigin(origins = "http://localhost:5173")
 public class ArtworkController {
 
+    private static final String ACTION_SAVE = "save";
+    private static final String ACTION_SUBMIT_REVIEW = "submitReview";
+    private static final String ACTION_RESUBMIT = "resubmit";
+    private static final String DECISION_APPROVE = "approve";
+    private static final String DECISION_REJECT = "reject";
+
     @Autowired
     private ArtworkRepository artworkRepository;
 
     @Autowired
     private FileStorageService fileStorageService;
-
-    private final ObjectMapper objectMapper = new ObjectMapper();
 
     @GetMapping
     public List<Artwork> getAll() {
@@ -42,46 +47,35 @@ public class ArtworkController {
 
         try {
             String safeTitle = title.replaceAll("[\\\\/:*?\"<>|]", "_");
-            String coverUrls = fileStorageService.storeFiles(coverFiles, safeTitle);
-            String modelFileUrls = fileStorageService.storeFiles(modelFiles, safeTitle);
+            FileStorageService.ArtworkStorageResult storageResult =
+                    fileStorageService.storeArtworkFiles(coverFiles, modelFiles, safeTitle);
 
             double totalSize = 0;
-            for (MultipartFile f : coverFiles) totalSize += f.getSize();
-            for (MultipartFile f : modelFiles) totalSize += f.getSize();
-            double fileSizeMB = totalSize / (1024.0 * 1024.0);
+            for (MultipartFile file : coverFiles) {
+                if (file != null) {
+                    totalSize += file.getSize();
+                }
+            }
+            for (MultipartFile file : modelFiles) {
+                if (file != null) {
+                    totalSize += file.getSize();
+                }
+            }
 
             Artwork artwork = new Artwork();
             artwork.setTitle(title);
             artwork.setDescription(description == null ? "" : description);
-            artwork.setCoverUrls(coverUrls);
-            artwork.setModelFileUrls(modelFileUrls);
-            artwork.setFileSize(fileSizeMB);
+            artwork.setCoverUrls(storageResult.getCoverUrls());
+            artwork.setModelFileUrls(storageResult.getModelFileUrls());
+            artwork.setFileSize(totalSize / (1024.0 * 1024.0));
+            artwork.setSyncStatus(ReviewStatus.PENDING_LINK);
             artwork.setCreatedAt(new Date());
             artwork.setUpdatedAt(new Date());
 
-            Artwork saved = artworkRepository.save(artwork);
-            return ResponseEntity.ok(saved);
+            return ResponseEntity.ok(artworkRepository.save(artwork));
         } catch (IOException e) {
             e.printStackTrace();
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("文件上传失败：" + e.getMessage());
-        }
-    }
-
-    @DeleteMapping("/{id}")
-    public ResponseEntity<?> deleteArtwork(@PathVariable Long id) {
-        Optional<Artwork> optional = artworkRepository.findById(id);
-        if (optional.isPresent()) {
-            Artwork artwork = optional.get();
-            String safeTitle = artwork.getTitle().replaceAll("[\\\\/:*?\"<>|]", "_");
-            try {
-                fileStorageService.deleteFolder(safeTitle);
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-            artworkRepository.deleteById(id);
-            return ResponseEntity.ok().build();
-        } else {
-            return ResponseEntity.notFound().build();
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("File upload failed: " + e.getMessage());
         }
     }
 
@@ -89,7 +83,10 @@ public class ArtworkController {
     public ResponseEntity<?> updateArtwork(
             @RequestParam("id") Long id,
             @RequestParam("title") String title,
-            @RequestParam("description") String description,
+            @RequestParam(value = "description", required = false) String description,
+            @RequestParam(value = "quarkUrl", required = false) String quarkUrl,
+            @RequestParam(value = "extractionCode", required = false) String extractionCode,
+            @RequestParam(value = "action", defaultValue = ACTION_SAVE) String action,
             @RequestParam(value = "removedCoverIndexes", required = false) String removedCoverIndexes,
             @RequestParam(value = "removedModelIndexes", required = false) String removedModelIndexes,
             @RequestParam(value = "newCoverFiles", required = false) List<MultipartFile> newCoverFiles,
@@ -99,87 +96,111 @@ public class ArtworkController {
         if (artwork == null) {
             return ResponseEntity.notFound().build();
         }
+        if (!ReviewStatus.canEdit(artwork.getSyncStatus())) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body("Only Pending Link or Sync Failed artworks can be edited");
+        }
+        if (!ReviewSupport.isBlank(removedCoverIndexes)
+                || !ReviewSupport.isBlank(removedModelIndexes)
+                || (newCoverFiles != null && !newCoverFiles.isEmpty())
+                || (newModelFiles != null && !newModelFiles.isEmpty())) {
+            return ResponseEntity.badRequest().body("File editing is unavailable in the current workflow");
+        }
 
-        // 更新标题和描述
+        String draftValidation = ReviewSupport.validateDraftQuarkInfo(quarkUrl);
+        if (draftValidation != null) {
+            return ResponseEntity.badRequest().body(draftValidation);
+        }
+
         artwork.setTitle(title);
-        artwork.setDescription(description);
+        artwork.setDescription(description == null ? "" : description);
+        artwork.setQuarkUrl(ReviewSupport.trimToNull(quarkUrl));
+        artwork.setExtractionCode(ReviewSupport.trimToNull(extractionCode));
 
-        // 获取当前文件列表（防御 null）
-        List<String> coverList = artwork.getCoverUrls() == null ? new ArrayList<>()
-                : new ArrayList<>(Arrays.asList(artwork.getCoverUrls().split(",")));
-        List<String> modelList = artwork.getModelFileUrls() == null ? new ArrayList<>()
-                : new ArrayList<>(Arrays.asList(artwork.getModelFileUrls().split(",")));
-
-        // 解析并删除封面文件（同时删除物理文件）
-        if (removedCoverIndexes != null && !removedCoverIndexes.isEmpty()) {
-            try {
-                List<Integer> removeIdx = objectMapper.readValue(removedCoverIndexes, new TypeReference<List<Integer>>() {});
-                removeIdx.sort(Comparator.reverseOrder());
-                for (int idx : removeIdx) {
-                    if (idx < coverList.size()) {
-                        String fileUrl = coverList.get(idx);
-                        // 删除磁盘上的物理文件
-                        try {
-                            fileStorageService.deleteFile(fileUrl);
-                        } catch (IOException e) {
-                            System.err.println("删除物理文件失败: " + fileUrl);
-                            e.printStackTrace();
-                        }
-                        coverList.remove(idx);
-                    }
-                }
-            } catch (Exception e) {
-                return ResponseEntity.badRequest().body("封面索引格式错误");
+        String normalizedAction = action == null ? ACTION_SAVE : action.trim();
+        if (ACTION_SUBMIT_REVIEW.equals(normalizedAction)) {
+            String validation = ReviewSupport.validateReviewSubmission(artwork.getQuarkUrl(), artwork.getExtractionCode());
+            if (validation != null) {
+                return ResponseEntity.badRequest().body(validation);
+            }
+            artwork.setSyncStatus(ReviewStatus.SYNCING);
+            artwork.setFailureReason(null);
+        } else if (ACTION_RESUBMIT.equals(normalizedAction)) {
+            if (!ReviewStatus.isSyncFailed(artwork.getSyncStatus())) {
+                return ResponseEntity.badRequest().body("Only Sync Failed artworks can be resubmitted");
+            }
+            String validation = ReviewSupport.validateReviewSubmission(artwork.getQuarkUrl(), artwork.getExtractionCode());
+            if (validation != null) {
+                return ResponseEntity.badRequest().body(validation);
+            }
+            artwork.setSyncStatus(ReviewStatus.SYNCING);
+            artwork.setFailureReason(null);
+        } else {
+            if (ReviewStatus.isPendingLink(artwork.getSyncStatus())) {
+                artwork.setSyncStatus(ReviewStatus.PENDING_LINK);
+            } else {
+                artwork.setSyncStatus(ReviewStatus.SYNC_FAILED);
             }
         }
 
-        // 解析并删除模型文件（同时删除物理文件）
-        if (removedModelIndexes != null && !removedModelIndexes.isEmpty()) {
-            try {
-                List<Integer> removeIdx = objectMapper.readValue(removedModelIndexes, new TypeReference<List<Integer>>() {});
-                removeIdx.sort(Comparator.reverseOrder());
-                for (int idx : removeIdx) {
-                    if (idx < modelList.size()) {
-                        String fileUrl = modelList.get(idx);
-                        try {
-                            fileStorageService.deleteFile(fileUrl);
-                        } catch (IOException e) {
-                            System.err.println("删除物理文件失败: " + fileUrl);
-                            e.printStackTrace();
-                        }
-                        modelList.remove(idx);
-                    }
-                }
-            } catch (Exception e) {
-                return ResponseEntity.badRequest().body("模型索引格式错误");
-            }
+        artwork.setUpdatedAt(new Date());
+        return ResponseEntity.ok(artworkRepository.save(artwork));
+    }
+
+    @PostMapping("/{id}/review")
+    public ResponseEntity<?> reviewArtwork(
+            @PathVariable Long id,
+            @RequestParam("decision") String decision,
+            @RequestParam(value = "failureReason", required = false) String failureReason) {
+
+        Artwork artwork = artworkRepository.findById(id).orElse(null);
+        if (artwork == null) {
+            return ResponseEntity.notFound().build();
+        }
+        if (!ReviewStatus.isSyncing(artwork.getSyncStatus())) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body("Only Syncing artworks can be reviewed");
         }
 
-        // 保存新上传的文件
-        String safeTitle = title.replaceAll("[\\\\/:*?\"<>|]", "_");
+        if (DECISION_APPROVE.equals(decision)) {
+            try {
+                fileStorageService.deleteFiles(artwork.getModelFileUrls());
+            } catch (IOException e) {
+                e.printStackTrace();
+                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("Failed to clean local archive");
+            }
+            artwork.setModelFileUrls(null);
+            artwork.setSyncStatus(ReviewStatus.SYNCED);
+            artwork.setFailureReason(null);
+        } else if (DECISION_REJECT.equals(decision)) {
+            String normalizedReason = ReviewSupport.trimToNull(failureReason);
+            if (normalizedReason == null) {
+                return ResponseEntity.badRequest().body("Failure reason is required");
+            }
+            artwork.setFailureReason(normalizedReason);
+            artwork.setSyncStatus(ReviewStatus.SYNC_FAILED);
+        } else {
+            return ResponseEntity.badRequest().body("Unsupported review decision");
+        }
+
+        artwork.setUpdatedAt(new Date());
+        return ResponseEntity.ok(artworkRepository.save(artwork));
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<?> deleteArtwork(@PathVariable Long id) {
+        Optional<Artwork> optional = artworkRepository.findById(id);
+        if (!optional.isPresent()) {
+            return ResponseEntity.notFound().build();
+        }
+
+        Artwork artwork = optional.get();
         try {
-            if (newCoverFiles != null && !newCoverFiles.isEmpty()) {
-                String newPaths = fileStorageService.storeFiles(newCoverFiles, safeTitle);
-                if (newPaths != null && !newPaths.isEmpty()) {
-                    coverList.addAll(Arrays.asList(newPaths.split(",")));
-                }
-            }
-            if (newModelFiles != null && !newModelFiles.isEmpty()) {
-                String newPaths = fileStorageService.storeFiles(newModelFiles, safeTitle);
-                if (newPaths != null && !newPaths.isEmpty()) {
-                    modelList.addAll(Arrays.asList(newPaths.split(",")));
-                }
-            }
+            fileStorageService.deleteFiles(artwork.getCoverUrls());
+            fileStorageService.deleteFiles(artwork.getModelFileUrls());
         } catch (IOException e) {
             e.printStackTrace();
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("文件保存失败");
         }
 
-        artwork.setCoverUrls(String.join(",", coverList));
-        artwork.setModelFileUrls(String.join(",", modelList));
-        artwork.setUpdatedAt(new Date());
-        artworkRepository.save(artwork);
-
+        artworkRepository.deleteById(id);
         return ResponseEntity.ok().build();
     }
 }

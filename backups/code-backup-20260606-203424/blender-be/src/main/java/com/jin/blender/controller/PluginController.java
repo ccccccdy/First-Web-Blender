@@ -1,10 +1,10 @@
 package com.jin.blender.controller;
 
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jin.blender.entity.Plugin;
 import com.jin.blender.repository.PluginRepository;
 import com.jin.blender.service.FileStorageService;
+import com.jin.blender.support.ReviewStatus;
+import com.jin.blender.support.ReviewSupport;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -14,14 +14,17 @@ import org.springframework.web.multipart.MultipartFile;
 import java.io.IOException;
 import java.util.Date;
 import java.util.List;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Comparator;
 
 @RestController
 @RequestMapping("/api/plugins")
 @CrossOrigin(origins = "http://localhost:5173")
 public class PluginController {
+
+    private static final String ACTION_SAVE = "save";
+    private static final String ACTION_SUBMIT_REVIEW = "submitReview";
+    private static final String ACTION_RESUBMIT = "resubmit";
+    private static final String DECISION_APPROVE = "approve";
+    private static final String DECISION_REJECT = "reject";
 
     @Autowired
     private PluginRepository pluginRepository;
@@ -29,7 +32,6 @@ public class PluginController {
     @Autowired
     private FileStorageService fileStorageService;
 
-    // 获取所有插件（支持按版本筛选，可选）
     @GetMapping
     public List<Plugin> getAll(@RequestParam(value = "version", required = false) String version) {
         if (version != null && !version.isEmpty()) {
@@ -38,122 +40,153 @@ public class PluginController {
         return pluginRepository.findAll();
     }
 
-    // 上传插件
     @PostMapping
     public ResponseEntity<?> createPlugin(
             @RequestParam("title") String title,
             @RequestParam(value = "description", required = false) String description,
-            @RequestParam("blenderVersion") String blenderVersion,
+            @RequestParam(value = "blenderVersion", required = false) String blenderVersion,
             @RequestParam("pluginFiles") List<MultipartFile> pluginFiles) {
 
         try {
-            // 使用插件标题作为子目录名（安全处理）
             String safeTitle = title.replaceAll("[\\\\/:*?\"<>|]", "_");
-            String subDir = "plugins/" + safeTitle;   // 统一存放在 up/plugins/ 下
-            String fileUrls = fileStorageService.storeFiles(pluginFiles, subDir);
+            String subDir = "plugins/" + safeTitle;
+            String fileUrl = fileStorageService.storeArchiveFiles(pluginFiles, subDir, safeTitle);
+            double fileSize = fileStorageService.getFileSizeMB(fileUrl);
 
             Plugin plugin = new Plugin();
             plugin.setTitle(title);
             plugin.setDescription(description == null ? "" : description);
-            plugin.setBlenderVersion(blenderVersion);
-            plugin.setFileUrls(fileUrls);
+            plugin.setBlenderVersion(blenderVersion == null ? "" : blenderVersion);
+            plugin.setFileUrls(fileUrl);
+            plugin.setFileSize(fileSize);
+            plugin.setSyncStatus(ReviewStatus.PENDING_LINK);
             plugin.setCreatedAt(new Date());
             plugin.setUpdatedAt(new Date());
 
-            Plugin saved = pluginRepository.save(plugin);
-            return ResponseEntity.ok(saved);
+            return ResponseEntity.ok(pluginRepository.save(plugin));
         } catch (IOException e) {
             e.printStackTrace();
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("文件上传失败：" + e.getMessage());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("File upload failed: " + e.getMessage());
         }
     }
 
-    // 删除插件（同时删除磁盘文件）
-    @DeleteMapping("/{id}")
-    public ResponseEntity<?> deletePlugin(@PathVariable Long id) {
-        Plugin plugin = pluginRepository.findById(id).orElse(null);
-        if (plugin == null) return ResponseEntity.notFound().build();
-
-        // 删除磁盘文件（根据 fileUrls 中的路径删除对应的子目录）
-        String safeTitle = plugin.getTitle().replaceAll("[\\\\/:*?\"<>|]", "_");
-        String subDir = "plugins/" + safeTitle;
-        try {
-            fileStorageService.deleteFolder(subDir);
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-        pluginRepository.deleteById(id);
-        return ResponseEntity.ok().build();
-    }
-
-    private final ObjectMapper objectMapper = new ObjectMapper();
     @PutMapping
     public ResponseEntity<?> updatePlugin(
             @RequestParam("id") Long id,
             @RequestParam("title") String title,
-            @RequestParam("description") String description,
+            @RequestParam(value = "description", required = false) String description,
             @RequestParam("blenderVersion") String blenderVersion,
+            @RequestParam(value = "quarkUrl", required = false) String quarkUrl,
+            @RequestParam(value = "extractionCode", required = false) String extractionCode,
+            @RequestParam(value = "action", defaultValue = ACTION_SAVE) String action,
             @RequestParam(value = "removedFileIndexes", required = false) String removedFileIndexes,
             @RequestParam(value = "newFiles", required = false) List<MultipartFile> newFiles) {
 
-        // 1. 查找原插件
+        Plugin plugin = pluginRepository.findById(id).orElse(null);
+        if (plugin == null) {
+            return ResponseEntity.notFound().build();
+        }
+        if (!ReviewStatus.canEdit(plugin.getSyncStatus())) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body("Only Pending Link or Sync Failed plugins can be edited");
+        }
+        if (!ReviewSupport.isBlank(removedFileIndexes) || (newFiles != null && !newFiles.isEmpty())) {
+            return ResponseEntity.badRequest().body("File editing is unavailable in the current workflow");
+        }
+
+        String draftValidation = ReviewSupport.validateDraftQuarkInfo(quarkUrl);
+        if (draftValidation != null) {
+            return ResponseEntity.badRequest().body(draftValidation);
+        }
+
+        plugin.setTitle(title);
+        plugin.setDescription(description == null ? "" : description);
+        plugin.setBlenderVersion(blenderVersion);
+        plugin.setQuarkUrl(ReviewSupport.trimToNull(quarkUrl));
+        plugin.setExtractionCode(ReviewSupport.trimToNull(extractionCode));
+
+        String normalizedAction = action == null ? ACTION_SAVE : action.trim();
+        if (ACTION_SUBMIT_REVIEW.equals(normalizedAction)) {
+            String validation = ReviewSupport.validateReviewSubmission(plugin.getQuarkUrl(), plugin.getExtractionCode());
+            if (validation != null) {
+                return ResponseEntity.badRequest().body(validation);
+            }
+            plugin.setSyncStatus(ReviewStatus.SYNCING);
+            plugin.setFailureReason(null);
+        } else if (ACTION_RESUBMIT.equals(normalizedAction)) {
+            if (!ReviewStatus.isSyncFailed(plugin.getSyncStatus())) {
+                return ResponseEntity.badRequest().body("Only Sync Failed plugins can be resubmitted");
+            }
+            String validation = ReviewSupport.validateReviewSubmission(plugin.getQuarkUrl(), plugin.getExtractionCode());
+            if (validation != null) {
+                return ResponseEntity.badRequest().body(validation);
+            }
+            plugin.setSyncStatus(ReviewStatus.SYNCING);
+            plugin.setFailureReason(null);
+        } else {
+            if (ReviewStatus.isPendingLink(plugin.getSyncStatus())) {
+                plugin.setSyncStatus(ReviewStatus.PENDING_LINK);
+            } else {
+                plugin.setSyncStatus(ReviewStatus.SYNC_FAILED);
+            }
+        }
+
+        plugin.setUpdatedAt(new Date());
+        return ResponseEntity.ok(pluginRepository.save(plugin));
+    }
+
+    @PostMapping("/{id}/review")
+    public ResponseEntity<?> reviewPlugin(
+            @PathVariable Long id,
+            @RequestParam("decision") String decision,
+            @RequestParam(value = "failureReason", required = false) String failureReason) {
+
+        Plugin plugin = pluginRepository.findById(id).orElse(null);
+        if (plugin == null) {
+            return ResponseEntity.notFound().build();
+        }
+        if (!ReviewStatus.isSyncing(plugin.getSyncStatus())) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body("Only Syncing plugins can be reviewed");
+        }
+
+        if (DECISION_APPROVE.equals(decision)) {
+            try {
+                fileStorageService.deleteFiles(plugin.getFileUrls());
+            } catch (IOException e) {
+                e.printStackTrace();
+                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("Failed to clean local archive");
+            }
+            plugin.setFileUrls(null);
+            plugin.setSyncStatus(ReviewStatus.SYNCED);
+            plugin.setFailureReason(null);
+        } else if (DECISION_REJECT.equals(decision)) {
+            String normalizedReason = ReviewSupport.trimToNull(failureReason);
+            if (normalizedReason == null) {
+                return ResponseEntity.badRequest().body("Failure reason is required");
+            }
+            plugin.setFailureReason(normalizedReason);
+            plugin.setSyncStatus(ReviewStatus.SYNC_FAILED);
+        } else {
+            return ResponseEntity.badRequest().body("Unsupported review decision");
+        }
+
+        plugin.setUpdatedAt(new Date());
+        return ResponseEntity.ok(pluginRepository.save(plugin));
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<?> deletePlugin(@PathVariable Long id) {
         Plugin plugin = pluginRepository.findById(id).orElse(null);
         if (plugin == null) {
             return ResponseEntity.notFound().build();
         }
 
-        // 2. 更新基本字段
-        plugin.setTitle(title);
-        plugin.setDescription(description);
-        plugin.setBlenderVersion(blenderVersion);
-
-        // 3. 获取现有文件列表
-        List<String> fileList = plugin.getFileUrls() == null ? new ArrayList<>()
-                : new ArrayList<>(Arrays.asList(plugin.getFileUrls().split(",")));
-
-        // 4. 删除被移除的文件（物理删除 + 从列表中移除）
-        if (removedFileIndexes != null && !removedFileIndexes.isEmpty()) {
-            try {
-                List<Integer> removeIdx = objectMapper.readValue(removedFileIndexes, new TypeReference<List<Integer>>() {});
-                removeIdx.sort(Comparator.reverseOrder());
-                for (int idx : removeIdx) {
-                    if (idx < fileList.size()) {
-                        String fileUrl = fileList.get(idx);
-                        // 物理删除文件
-                        try {
-                            fileStorageService.deleteFile(fileUrl);
-                        } catch (IOException e) {
-                            e.printStackTrace();
-                            // 可以记录日志但继续处理
-                        }
-                        fileList.remove(idx);
-                    }
-                }
-            } catch (Exception e) {
-                return ResponseEntity.badRequest().body("文件索引格式错误");
-            }
+        try {
+            fileStorageService.deleteFiles(plugin.getFileUrls());
+        } catch (IOException e) {
+            e.printStackTrace();
         }
 
-        // 5. 保存新上传的文件
-        String safeTitle = title.replaceAll("[\\\\/:*?\"<>|]", "_");
-        String subDir = "plugins/" + safeTitle;
-        if (newFiles != null && !newFiles.isEmpty()) {
-            try {
-                String newFilePaths = fileStorageService.storeFiles(newFiles, subDir);
-                if (newFilePaths != null && !newFilePaths.isEmpty()) {
-                    fileList.addAll(Arrays.asList(newFilePaths.split(",")));
-                }
-            } catch (IOException e) {
-                e.printStackTrace();
-                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("文件保存失败");
-            }
-        }
-
-        // 6. 更新数据库
-        plugin.setFileUrls(String.join(",", fileList));
-        plugin.setUpdatedAt(new Date());
-        pluginRepository.save(plugin);
-
+        pluginRepository.deleteById(id);
         return ResponseEntity.ok().build();
     }
 }
