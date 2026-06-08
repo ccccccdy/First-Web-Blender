@@ -1,6 +1,6 @@
 .idea/
-blender-fo/
 .m2/
 *.log
 **/target/
 **/node_modules/
+backups/**/blender-fo/
